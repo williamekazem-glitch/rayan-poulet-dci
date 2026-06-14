@@ -1,174 +1,950 @@
+"""
+Poulet d'Ci WhatsApp Webhook Server
+Reçoit les messages WhatsApp entrants et répond via Claude (Rayan)
+Workflow superviseur : escalade texte + transfert images
+"""
 import os
-import json
 import httpx
 import asyncio
+import random
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, Response
-from anthropic import Anthropic
+from fastapi.responses import PlainTextResponse
 
 app = FastAPI()
-client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+
+# Cache local de l'historique (évite trop d'appels Supabase dans la même session)
+conversation_history: dict = {}
+
+# Escalade texte : client_number -> question posée
+pending_supervisor: dict = {}
+
+# Transfert image : client en attente d'une capture (livraison Yango)
+pending_image_transfer: str = ""  # numéro du dernier client qui attend une capture
+
+# Catalogue photos produits : { "sac cabas": media_id, ... }
+product_images: dict = {}
+
+# Clients en attente d'une image produit : { "product_name": "client_number" }
+pending_product_image: dict = {}
+
+# Cache local des infos ADMIN (chargé depuis Supabase au démarrage)
+admin_knowledge: list = []
+
+
+async def load_admin_knowledge():
+    """Charge les infos ADMIN depuis Supabase au démarrage"""
+    global admin_knowledge
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/admin_knowledge?select=info&order=created_at.asc",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}"
+                }
+            )
+        if response.status_code == 200:
+            data = response.json()
+            admin_knowledge = [row["info"] for row in data]
+            print(f"Supabase: {len(admin_knowledge)} infos ADMIN chargées")
+    except Exception as e:
+        print(f"Erreur chargement Supabase: {e}")
+
+
+async def save_admin_knowledge(info: str):
+    """Sauvegarde une nouvelle info ADMIN dans Supabase"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/admin_knowledge",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal"
+                },
+                json={"info": info}
+            )
+        print(f"Supabase save status: {response.status_code} | body: {response.text}")
+        return response.status_code in (200, 201)
+    except Exception as e:
+        print(f"Erreur sauvegarde Supabase: {e}")
+        return False
+
+
+async def save_admin_image(name: str, media_id: str):
+    """Sauvegarde une image ADMIN dans Supabase (table admin_images)"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/admin_images",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal"
+                },
+                json={"name": name, "media_id": media_id}
+            )
+        print(f"Supabase image save: {response.status_code}")
+        return response.status_code in (200, 201)
+    except Exception as e:
+        print(f"Erreur sauvegarde image Supabase: {e}")
+        return False
+
+
+async def get_admin_images() -> list:
+    """Charge toutes les images ADMIN depuis Supabase"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/admin_images?select=name,media_id",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}"
+                }
+            )
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        print(f"Erreur chargement images Supabase: {e}")
+    return []
+
+
+async def load_conversation(phone: str) -> list:
+    """Charge l'historique d'une conversation depuis Supabase"""
+    if phone in conversation_history:
+        return conversation_history[phone]
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/conversation_history?phone=eq.{phone}&select=messages",
+                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            )
+        if response.status_code == 200:
+            data = response.json()
+            msgs = data[0]["messages"] if data else []
+            conversation_history[phone] = msgs
+            return msgs
+    except Exception as e:
+        print(f"Erreur chargement historique: {e}")
+    conversation_history[phone] = []
+    return []
+
+
+async def save_conversation(phone: str, messages: list):
+    """Sauvegarde l'historique d'une conversation dans Supabase (upsert)"""
+    conversation_history[phone] = messages
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/conversation_history",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates"
+                },
+                json={"phone": phone, "messages": messages, "updated_at": datetime.now(timezone.utc).isoformat()}
+            )
+    except Exception as e:
+        print(f"Erreur sauvegarde historique: {e}")
+
+
+async def save_order(phone: str, name: str, product: str, quantity: str, address: str):
+    """Sauvegarde une commande confirmée dans Supabase"""
+    try:
+        async with httpx.AsyncClient() as c:
+            await c.post(
+                f"{SUPABASE_URL}/rest/v1/orders",
+                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
+                json={"client_phone": phone, "client_name": name, "product": product, "quantity": quantity, "address": address}
+            )
+    except Exception as e:
+        print(f"Erreur save order: {e}")
+
+
+async def get_daily_stats() -> dict:
+    """Récupère les stats du jour depuis Supabase"""
+    today = datetime.now(ABIDJAN_TZ).strftime("%Y-%m-%d")
+    stats = {"clients": 0, "commandes": 0, "sans_reponse": len(pending_supervisor)}
+    try:
+        async with httpx.AsyncClient() as c:
+            r1 = await c.get(
+                f"{SUPABASE_URL}/rest/v1/conversation_history?updated_at=gte.{today}&select=phone",
+                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            )
+            if r1.status_code == 200:
+                stats["clients"] = len(r1.json())
+
+            r2 = await c.get(
+                f"{SUPABASE_URL}/rest/v1/orders?created_at=gte.{today}&select=id",
+                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            )
+            if r2.status_code == 200:
+                stats["commandes"] = len(r2.json())
+    except Exception as e:
+        print(f"Erreur stats: {e}")
+    return stats
+
+
+async def envoyer_recap_quotidien():
+    """Envoie le récap du matin à Wallid"""
+    stats = await get_daily_stats()
+    sans_rep = "\n".join([f"- +{num} : {q}" for num, q in pending_supervisor.items()]) or "Aucune"
+    msg = (
+        f"*Bonjour — Récap Rayan (Poulet d'Ci)*\n\n"
+        f"Clients actifs aujourd'hui : {stats['clients']}\n"
+        f"Commandes enregistrées : {stats['commandes']}\n"
+        f"Questions sans réponse : {stats['sans_reponse']}\n\n"
+        f"*Questions en attente :*\n{sans_rep}"
+    )
+    await send_whatsapp_message(SUPERVISOR_NUMBER, msg)
+    print("Récap quotidien envoyé")
+
+
+async def scheduler_recap():
+    """Lance le récap chaque matin à 9h Abidjan"""
+    while True:
+        now = datetime.now(ABIDJAN_TZ)
+        demain_9h = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        if now.hour < 9:
+            demain_9h = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        attente = (demain_9h - now).total_seconds()
+        await asyncio.sleep(attente)
+        await envoyer_recap_quotidien()
+
+
+# ── RELANCE CLIENTS FROIDS ─────────────────────────────────────────────────
+
+# Suivi : { phone: {"question": str, "task": asyncio.Task} }
+clients_en_attente_relance: dict = {}
+
+
+async def relance_client_froid(phone: str, dernier_sujet: str):
+    """Attend 48h puis relance le client s'il n'a pas commandé"""
+    await asyncio.sleep(48 * 3600)
+    # Vérifier si le client a passé commande depuis
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{SUPABASE_URL}/rest/v1/orders?client_phone=eq.{phone}&select=id",
+                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            )
+            if r.status_code == 200 and r.json():
+                print(f"Pas de relance pour {phone} — commande déjà passée")
+                return
+    except:
+        pass
+
+    # Générer un message de relance personnalisé
+    prompt = f"""Tu es Rayan de Poulet d'Ci (poulet, Abidjan). Un client t'a posé une question sur "{dernier_sujet}" il y a 48h mais n'a pas commandé.
+Écris un message de relance court, chaleureux, en vouvoyant. Maximum 2 lignes. Sans emoji. Ne mentionne pas le délai de 48h."""
+
+    async with httpx.AsyncClient(timeout=15.0) as c:
+        r = await c.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 100, "messages": [{"role": "user", "content": prompt}]}
+        )
+    message_relance = r.json()["content"][0]["text"].strip()
+    await send_whatsapp_message(phone, message_relance)
+    print(f"Relance client froid envoyée à {phone} : {message_relance[:60]}")
+    clients_en_attente_relance.pop(phone, None)
+
+
+async def detecter_commande(from_number: str, historique: list):
+    """Détecte si une commande vient d'être confirmée et notifie Wallid"""
+    if len(historique) < 2:
+        return
+    historique_texte = "\n".join([f"{m['role']}: {m['content']}" for m in historique[-8:]])
+    prompt = f"""Analyse cette conversation WhatsApp d'une entreprise de poulet (Poulet d'Ci : ferme, magasin de produits frais, restaurant Domini Chap).
+
+{historique_texte}
+
+Une commande vient-elle d'être confirmée dans cette conversation (le client a donné son nom, produit, quantité ET adresse) ?
+Si oui, réponds au format exact :
+NOM: [nom complet]
+PRODUIT: [produit]
+QUANTITE: [quantité]
+ADRESSE: [adresse]
+
+Si non, réponds uniquement : non"""
+
+    async with httpx.AsyncClient(timeout=15.0) as c:
+        r = await c.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]}
+        )
+    resultat = r.json()["content"][0]["text"].strip()
+    print(f"Détection commande : {resultat[:80]}")
+
+    if resultat.lower().startswith("non"):
+        return
+
+    # Parser la fiche
+    lignes = {l.split(":")[0].strip(): l.split(":", 1)[1].strip() for l in resultat.splitlines() if ":" in l}
+    nom = lignes.get("NOM", "Inconnu")
+    produit = lignes.get("PRODUIT", "?")
+    quantite = lignes.get("QUANTITE", "?")
+    adresse = lignes.get("ADRESSE", "?")
+
+    # Anti-doublon : ne pas re-notifier si la même commande existe déjà aujourd'hui
+    today = datetime.now(ABIDJAN_TZ).strftime("%Y-%m-%d")
+    try:
+        async with httpx.AsyncClient() as c:
+            existing = await c.get(
+                f"{SUPABASE_URL}/rest/v1/orders?client_phone=eq.{from_number}&created_at=gte.{today}&select=product,quantity",
+                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            )
+            if existing.status_code == 200:
+                for o in existing.json():
+                    if o.get("product") == produit and o.get("quantity") == quantite:
+                        print(f"Commande déjà enregistrée pour {from_number}, pas de re-notification")
+                        return
+    except Exception as e:
+        print(f"Erreur vérif doublon commande: {e}")
+
+    await save_order(from_number, nom, produit, quantite, adresse)
+    # Annuler la relance client froid puisqu'il a commandé
+    if from_number in clients_en_attente_relance:
+        clients_en_attente_relance[from_number]["task"].cancel()
+        clients_en_attente_relance.pop(from_number, None)
+    fiche = (
+        f"NOUVELLE COMMANDE\n\n"
+        f"Client : {nom} (+{from_number})\n"
+        f"Produit : {produit}\n"
+        f"Quantité : {quantite}\n"
+        f"Adresse : {adresse}\n\n"
+        f"Statut : En attente de traitement"
+    )
+    await send_whatsapp_message(SUPERVISOR_NUMBER, fiche)
+    print(f"Commande détectée et envoyée à Wallid : {nom}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    await load_admin_knowledge()
+    images = await get_admin_images()
+    for item in images:
+        product_images[item["name"]] = item["media_id"]
+    print(f"Images produits chargées : {list(product_images.keys())}")
+    asyncio.create_task(scheduler_recap())
 
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
-VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
+WHATSAPP_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "poulet_dci_webhook_2024")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "1084842851388985")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+API_BASE = "https://graph.facebook.com/v25.0"
+
 SUPERVISOR_NUMBER = os.environ.get("SUPERVISOR_NUMBER", "2250508316332")
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
+# Numéros autorisés à envoyer des commandes ADMIN
 ADMIN_NUMBERS = {
     "2250710111118",   # Wallid
     "2250151636363",   # Poulet d'Ci Humain
 }
 
 ESCALADE_TRIGGER = "Je transmets votre demande"
+LIVRAISON_TRIGGER = "localisation"  # mot clé dans la réponse de Rayan pour activer le suivi livraison
 
-# Historique des conversations en mémoire
-conversation_history = {}
+SYSTEM_PROMPT = """Tu es Rayan, l'assistant commercial de Poulet d'Ci, une entreprise ivoirienne spécialisée dans le poulet à Abidjan, Côte d'Ivoire.
+Tu ne mentionnes jamais que tu es un robot, une IA ou un assistant virtuel. Tu es simplement Rayan.
 
-RAYAN_SYSTEM = """Tu es Rayan, l'assistante virtuelle de Poulet d'Ci.
+QUI TU ES :
+Tu es une personne intelligente, réfléchie et ouverte d'esprit. Tu n'es pas un script figé — tu t'adaptes à chaque client, tu comprends ce qu'il veut dire même s'il s'exprime mal, et tu penses par toi-même.
+Tu peux avoir une vraie conversation. Si un client te parle d'autre chose que Poulet d'Ci, tu peux répondre naturellement comme une vraie personne le ferait — avec bon sens et bienveillance — avant de revenir doucement vers ce que tu peux lui apporter chez Poulet d'Ci.
+Tu ne bloques jamais sur une question inattendue. Tu réfléchis, tu t'adaptes, tu réponds.
 
-Poulet d'Ci est une entreprise ivoirienne spécialisée dans tout ce qui concerne le poulet :
-- Une ferme avicole : Poulet d'Ci produit sa propre volaille de qualité
-- Un magasin de produits frais : poulet entier frais, poulet mariné, poulet découpé (blanc, cuisse, aile, gésier...), poulet prêt à cuisiner
-- Domini Chap : le restaurant en ligne de Poulet d'Ci, qui propose uniquement des plats à base de poulet (sandwich poulet, poulet grillé, poulet braisé, poulet sauté, soupe de poulet, etc.)
+TONE ET STYLE :
+- Ton posé, intelligent et bienveillant
+- Chaleureux sans être familier, sérieux sans être froid
+- Phrases courtes et claires, 2-3 lignes maximum par message
+- Pas de listes à puces, pas de blocs séparés
+- Toujours courtois, jamais pressé
+- Tu parles comme une vraie personne, pas comme un robot qui suit des règles
 
-Ton rôle :
-- Accueillir chaleureusement les clients
-- Répondre aux questions sur les produits, les prix, les disponibilités
-- Prendre les commandes (magasin ou Domini Chap)
-- Informer sur les horaires, la livraison, les points de vente
-- Parler français, nouchi ou dioula selon comment le client s'exprime
+VOUVOIEMENT ET POLITESSE :
+- Tu vouvoies TOUJOURS les clients. Jamais de "tu".
+- Dès que tu connais le prénom du client, utilise "Monsieur [Prénom]" ou "Madame [Prénom]" selon le genre.
+- Si le genre est inconnu, utilise "Monsieur/Madame" ou juste le prénom en attendant.
+- Si c'est un client qui revient (il mentionne une commande passée ou se présente), accueille-le chaleureusement : "Bonjour Monsieur Wallid, ravi de vous revoir. Comment puis-je vous aider ?"
+- Exemples : "Bien sûr Monsieur Jean." / "Je comprends Madame Fatou." / "Merci pour votre confiance Monsieur Kofi."
 
-Ton caractère : tu es souriante, dynamique, efficace. Tu représentes une marque moderne et professionnelle.
+TON RÔLE DE COMMERCIAL (LE PLUS IMPORTANT) :
+Tu n'es pas un simple preneur de commande. Tu es le MEILLEUR commercial de Poulet d'Ci. Ton but : donner envie au client de manger ou de s'approvisionner chez Poulet d'Ci, et le convaincre de notre qualité.
 
-Si tu ne connais pas la réponse à une question (prix spécifique, stock, délai particulier), dis :
-"Je transmets votre demande à notre équipe qui vous répondra rapidement."
+1. COMPRENDRE AVANT DE VENDRE :
+Pose des questions pour cerner le besoin. "C'est pour votre famille, un événement, ou pour revendre ?" "Vous cherchez du poulet frais à cuisiner ou un plat prêt à déguster ?" Plus tu comprends, mieux tu conseilles.
 
-Ne dépasse jamais 3 phrases par réponse sauf si le client pose une question qui nécessite plus de détails."""
+2. CRÉER L'ENVIE ET MONTRER LA VALEUR :
+Mets en avant ce qui rend Poulet d'Ci unique, avec des arguments concrets :
+- Notre poulet vient de NOTRE ferme : fraîcheur garantie, pas du congelé importé d'origine douteuse. Vous savez exactement ce que vous mangez.
+- Qualité et goût : un poulet bien élevé a une chair plus ferme et plus savoureuse.
+- Praticité : poulet déjà découpé, mariné ou prêt à cuisiner — vous gagnez du temps en cuisine.
+- Domini Chap : des plats à base de poulet savoureux, préparés et livrés, parfaits quand vous n'avez pas le temps de cuisiner.
+- Pour les revendeurs et restaurants : un approvisionnement régulier et fiable, en direct du producteur.
 
-async def get_admin_knowledge():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return ""
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(
-                f"{SUPABASE_URL}/rest/v1/admin_knowledge?select=info&order=created_at.desc&limit=50",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-            )
-            if r.status_code == 200:
-                items = r.json()
-                return "\n".join([i["info"] for i in items]) if items else ""
-    except:
-        pass
-    return ""
+3. ADAPTER L'ARGUMENT AU CLIENT :
+Famille → fraîcheur, qualité, praticité du découpé/mariné. Événement (fête, baptême) → grandes quantités, poulet de qualité pour impressionner les invités. Restaurant/revendeur → fiabilité de l'approvisionnement et prix producteur. Personne pressée → Domini Chap, plat prêt et livré.
 
-async def save_admin_knowledge(info: str):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return False
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.post(
-                f"{SUPABASE_URL}/rest/v1/admin_knowledge",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
-                json={"info": info}
-            )
-            return r.status_code == 201
-    except:
-        return False
+4. GÉRER LES OBJECTIONS AVEC TACT :
+- "C'est cher" → recentrer sur la valeur : "Je comprends. Mais c'est un poulet frais de notre ferme, pas du congelé. La qualité et le goût font la différence dans votre assiette."
+- "Je vais réfléchir" → garder le contact : "Bien sûr, prenez votre temps. Puis-je vous mettre de côté une belle pièce fraîche pour aujourd'hui ?"
+- Hésitation → rassurer : "Essayez une première fois, vous goûterez la différence. Beaucoup de nos clients ne reviennent plus en arrière."
 
-async def send_whatsapp(to: str, message: str):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": message}}
-    async with httpx.AsyncClient() as c:
-        await c.post(url, headers=headers, json=payload)
+5. TOUJOURS GUIDER VERS L'ACTION :
+Termine tes messages en faisant avancer le client : proposer une quantité, un plat Domini Chap, une livraison, voir une photo. Ne laisse jamais la conversation s'éteindre sans une prochaine étape.
 
-async def ask_rayan(sender: str, user_message: str) -> str:
-    knowledge = await get_admin_knowledge()
+RESTE ÉLÉGANT : tu convaincs par la qualité et le conseil, jamais par la pression. Tu donnes envie, tu ne forces pas. Et tu ne mens JAMAIS sur les prix ou les produits de Poulet d'Ci.
 
-    if sender not in conversation_history:
-        conversation_history[sender] = []
+EXEMPLES DE BONNES RÉPONSES :
+- Premier contact : "Bonjour, je suis Rayan de Poulet d'Ci. Je suis là pour vous accompagner, comment puis-je vous aider ?"
+- Découverte : "Avec plaisir. Dites-moi, c'est pour cuisiner à la maison, pour un événement, ou pour revendre ? Cela m'aidera à vous conseiller au mieux."
+- Argument valeur : "Notre poulet vient directement de notre ferme, il est frais du jour. Vous sentirez la différence de goût par rapport au congelé."
+- Objection prix : "Je comprends. Mais c'est un poulet frais de notre élevage, pas de l'importé congelé. La qualité se ressent dans l'assiette. Souhaitez-vous essayer une pièce ?"
+- Ne sait pas : "Je transmets votre demande à notre équipe qui vous répondra dans les plus brefs délais."
 
-    conversation_history[sender].append({"role": "user", "content": user_message})
+EXEMPLES DE RÉPONSES À ÉVITER :
+- "Je m'appelle Rayan, je suis l'assistant de Poulet d'Ci. Nous sommes spécialisés dans la vente de poulet à Abidjan. Comment puis-je vous aider ?" → trop long
+- Inventer un prix au poulet que tu ne connais pas → INTERDIT
 
-    # Garder max 20 messages par conversation
-    if len(conversation_history[sender]) > 20:
-        conversation_history[sender] = conversation_history[sender][-20:]
+INFORMATIONS POULET D'CI :
+- Nom : Poulet d'Ci
+- Activité : entreprise ivoirienne spécialisée dans le poulet (de la ferme à l'assiette)
+- Trois pôles : la ferme avicole, le magasin de produits frais, et Domini Chap (le restaurant en ligne)
+- WhatsApp équipe humaine : +225 01 51 63 63 63
 
-    system = RAYAN_SYSTEM
-    if knowledge:
-        system += f"\n\nInformations mises à jour par l'équipe Poulet d'Ci :\n{knowledge}"
+NOS POLES :
+1. LA FERME AVICOLE
+Poulet d'Ci élève sa propre volaille. C'est notre force : nous maîtrisons la qualité du début à la fin, et notre poulet est frais, local, traçable.
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=500,
-        system=system,
-        messages=conversation_history[sender]
-    )
+2. LE MAGASIN DE PRODUITS FRAIS
+- Poulet entier frais
+- Poulet mariné (prêt à cuire)
+- Poulet découpé : blanc, cuisse, aile, gésier...
+- Poulet prêt à cuisiner
+Ces produits font gagner du temps en cuisine tout en garantissant la fraîcheur.
 
-    reply = response.content[0].text
-    conversation_history[sender].append({"role": "assistant", "content": reply})
+3. DOMINI CHAP — LE RESTAURANT EN LIGNE
+Restaurant en ligne de Poulet d'Ci, qui propose uniquement des plats à base de poulet : sandwich poulet, poulet grillé, poulet braisé, poulet sauté, soupe de poulet, etc. Préparés et livrés.
+
+PRIX :
+Tu ne connais PAS encore les prix exacts. Tant qu'un prix ne t'a pas été communiqué par l'équipe, ne l'invente JAMAIS. Réponds : "Je transmets votre demande à notre équipe qui vous donnera le prix exact." Les prix te seront ajoutés au fur et à mesure par l'équipe.
+
+PAIEMENT :
+Le règlement se fait par Wave ou Orange Money. Le numéro exact te sera communiqué par l'équipe si tu ne l'as pas encore.
+
+LIVRAISON :
+Les livraisons se font via Yango Livraison. Voici le processus exact :
+
+Etape 1 — Collecte de la localisation :
+Demande au client de partager sa localisation de préférence via WhatsApp (bouton localisation), ou un lien Google Maps. Une fois reçue, transmets-la à l'équipe.
+
+Etape 2 — Capture Yango :
+L'équipe envoie une capture avec les options de livraison. Quand tu reçois la capture, transmets-la au client avec : "Voici les options de livraison pour votre adresse. Laquelle préférez-vous ?"
+
+Etape 3 — Choix du client :
+Quand le client choisit, confirme à l'équipe : "Le client a choisi [option]."
+
+Livreur personnel :
+Si le client préfère envoyer son propre livreur, informe-le : "Pas de problème. Merci d'appeler le +225 01 51 63 63 63 pour confirmer notre disponibilité avant d'envoyer votre livreur."
+
+IMAGES PRODUITS :
+Tu as des photos de certains produits et plats que tu peux envoyer aux clients. Si un client demande à voir un produit ou un plat, réponds positivement : "Oui, je peux vous montrer." ou "Voici une photo." — ne dis jamais que tu n'as pas d'images. Le système enverra automatiquement la photo correspondante.
+
+REGLES IMPORTANTES :
+- Tu es ouvert d'esprit : si un client parle d'autre chose que Poulet d'Ci, réponds naturellement avec bon sens, puis ramène doucement la conversation vers Poulet d'Ci si c'est pertinent.
+- Si tu ne connais pas la réponse à une question liée à Poulet d'Ci, dis : "Je transmets votre demande à notre équipe qui vous répondra dans les plus brefs délais."
+- Ne JAMAIS inventer des prix, produits ou informations qui ne sont pas dans ce prompt. Zéro improvisation sur les chiffres ou les offres.
+- Ne JAMAIS dire que tu n'as pas d'images — tu en as pour certains produits.
+- Ne jamais dire "Bonjour" plus d'une fois par conversation
+- "Bonjour" uniquement au tout premier message si le client vient de saluer
+- Réponses courtes et directes — maximum 3-4 lignes
+- Zéro emoji dans les messages
+- Style professionnel et courtois
+- Si le client veut commander, collecte : nom complet, produit ou plat souhaité, quantité, adresse de livraison
+
+FAUTES D'ORTHOGRAPHE :
+Les clients écrivent souvent avec des fautes. Tu dois reconnaître les produits Poulet d'Ci même mal orthographiés.
+Exemples : "poule mariné" = poulet mariné, "domini chape" = Domini Chap, "gésié" = gésier, "poulet braizé" = poulet braisé.
+Si tu n'es pas sûr de ce que le client veut dire, pose la question : "Parlez-vous de [nom correct du produit] ?"
+Ne jamais refuser de répondre uniquement à cause d'une faute d'orthographe."""
+
+IMPROVE_PROMPT = """Tu es Rayan, assistant commercial de Poulet d'Ci (poulet, Abidjan).
+On t'a transmis une ébauche de réponse à envoyer à un client.
+Améliore ce texte en adoptant un ton posé, professionnel et bienveillant : chaleureux sans être familier, sérieux sans être froid.
+Réponse courte (3-4 lignes max), zéro emoji, zéro "Bonjour" si ce n'est pas le premier message.
+Réponds uniquement avec le texte amélioré, rien d'autre."""
+
+
+async def send_whatsapp_message(to: str, message: str):
+    """Envoie un message texte WhatsApp"""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{API_BASE}/{PHONE_NUMBER_ID}/messages",
+            headers={
+                "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": to,
+                "type": "text",
+                "text": {"body": message}
+            }
+        )
+    return response.json()
+
+
+async def send_whatsapp_image(to: str, media_id: str, caption: str = ""):
+    """Transfert une image WhatsApp via son media_id"""
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "image",
+        "image": {"id": media_id}
+    }
+    if caption:
+        payload["image"]["caption"] = caption
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{API_BASE}/{PHONE_NUMBER_ID}/messages",
+            headers={
+                "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json=payload
+        )
+    return response.json()
+
+
+async def get_claude_response(from_number: str, user_message: str) -> str:
+    """Appelle Claude avec l'historique de conversation (persisté dans Supabase)"""
+    msgs = await load_conversation(from_number)
+    msgs.append({"role": "user", "content": user_message})
+    messages = msgs[-20:]
+
+    # Recharger les infos ADMIN depuis Supabase à chaque appel
+    await load_admin_knowledge()
+
+    # Ajouter les infos ADMIN dynamiques au prompt
+    system = SYSTEM_PROMPT
+    if admin_knowledge:
+        system += "\n\nINFOS MISES À JOUR PAR L'ÉQUIPE :\n" + "\n".join(f"- {info}" for info in admin_knowledge)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 500,
+                "system": system,
+                "messages": messages
+            }
+        )
+    data = response.json()
+    reply = data["content"][0]["text"]
+    messages.append({"role": "assistant", "content": reply})
+    await save_conversation(from_number, messages)
     return reply
+
+
+async def improve_supervisor_draft(client_number: str, original_question: str, draft: str) -> str:
+    """Améliore le brouillon de Wallid avant de l'envoyer au client"""
+    prompt = f"Question du client : {original_question}\n\nÉbauche de réponse : {draft}\n\nAméliore cette réponse pour l'envoyer au client."
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 500,
+                "system": IMPROVE_PROMPT,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+        )
+    data = response.json()
+    improved = data["content"][0]["text"]
+
+    msgs = await load_conversation(client_number)
+    msgs.append({"role": "assistant", "content": improved})
+    await save_conversation(client_number, msgs[-20:])
+    return improved
+
+
+ABIDJAN_TZ = timezone(timedelta(hours=0))  # Abidjan = GMT+0
+
+def prochaine_relance_secondes() -> float:
+    """Retourne le délai en secondes avant la prochaine relance (30min si 9h-18h, sinon prochain 9h)"""
+    now = datetime.now(ABIDJAN_TZ)
+    heure = now.hour
+    if 9 <= heure < 18:
+        return 30 * 60  # 30 minutes
+    elif heure < 9:
+        # Tôt le matin (minuit-9h) → aujourd'hui à 9h
+        cible = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        return (cible - now).total_seconds()
+    else:
+        # Après 18h → lendemain à 9h
+        demain = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        return (demain - now).total_seconds()
+
+
+async def relance_supervisor(client_number: str, question: str):
+    """Attend le délai approprié puis relance le superviseur si la question est toujours sans réponse"""
+    delai = prochaine_relance_secondes()
+    await asyncio.sleep(delai)
+    if client_number in pending_supervisor:
+        await send_whatsapp_message(
+            SUPERVISOR_NUMBER,
+            f"RELANCE — Le client +{client_number} attend toujours une réponse.\nQuestion : {question}\n\nReponds-moi directement."
+        )
+        print(f"Relance envoyée pour {client_number}")
+
+
+async def notify_supervisor(client_number: str, question: str):
+    """Notifie Wallid qu'un client attend une réponse texte + programme une relance"""
+    msg = (
+        f"CLIENT EN ATTENTE\n"
+        f"Numero : +{client_number}\n"
+        f"Question : {question}\n\n"
+        f"• Reponds directement → je transmets au client (one shot)\n"
+        f"• Reponds avec ADMIN: ta reponse → je transmets ET je retiens pour toujours"
+    )
+    await send_whatsapp_message(SUPERVISOR_NUMBER, msg)
+    asyncio.create_task(relance_supervisor(client_number, question))
+    print(f"Superviseur notifié pour le client {client_number}")
+
+
+async def notify_supervisor_location(client_number: str, location_info: str):
+    """Notifie Wallid qu'un client a partagé sa localisation — en attente de capture Yango"""
+    global pending_image_transfer
+    pending_image_transfer = client_number
+    msg = (
+        f"LOCALISATION RECUE\n"
+        f"Client : +{client_number}\n"
+        f"Localisation : {location_info}\n\n"
+        f"Envoie-moi la capture Yango et je la transmettrai directement au client."
+    )
+    await send_whatsapp_message(SUPERVISOR_NUMBER, msg)
+    print(f"Localisation transmise à Wallid pour le client {client_number}")
+
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     params = dict(request.query_params)
-    if params.get("hub.verify_token") == VERIFY_TOKEN and params.get("hub.mode") == "subscribe":
-        return Response(content=params.get("hub.challenge", ""), media_type="text/plain")
-    return Response(content="Forbidden", status_code=403)
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+        return PlainTextResponse(challenge)
+    return Response(status_code=403)
+
 
 @app.post("/webhook")
-async def receive_message(request: Request):
-    try:
-        data = await request.json()
-        entry = data.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
+async def receive_webhook(request: Request):
+    global pending_image_transfer
+    body = await request.json()
 
-        if not messages:
+    try:
+        entry = body["entry"][0]
+        changes = entry["changes"][0]
+        value = changes["value"]
+
+        if "messages" not in value:
+            return {"status": "no_message"}
+
+        message = value["messages"][0]
+        from_number = message["from"]
+        msg_type = message.get("type", "")
+
+        print(f"Message recu de {from_number}, type: {msg_type}")
+
+        # ── CAS 0 : COMMANDE ADMIN ─────────────────────────────────────────
+        # ADMIN texte
+        if msg_type == "text" and message["text"]["body"].upper().startswith("ADMIN:"):
+            user_text = message["text"]["body"]
+            if from_number in ADMIN_NUMBERS:
+                info = user_text[6:].strip()
+                admin_knowledge.append(info)
+                saved = await save_admin_knowledge(info)
+                status = "enregistree" if saved else "enregistree en memoire uniquement"
+
+                # Si un client était en attente d'escalade, répondre avec cette info
+                if pending_supervisor:
+                    client_number, original_question = next(iter(pending_supervisor.items()))
+                    del pending_supervisor[client_number]
+                    await asyncio.sleep(random.uniform(1, 2))
+                    improved = await improve_supervisor_draft(client_number, original_question, info)
+                    await send_whatsapp_message(client_number, improved)
+                    await send_whatsapp_message(
+                        from_number,
+                        f"Info {status} et réponse transmise au client +{client_number}."
+                    )
+                    print(f"ADMIN réponse + sauvegarde pour client {client_number}: {info}")
+                else:
+                    await send_whatsapp_message(
+                        from_number,
+                        f"Info {status} pour Rayan :\n\"{info}\"\n\nTotal : {len(admin_knowledge)} infos"
+                    )
+                print(f"ADMIN info ajoutee par {from_number}: {info}")
+            else:
+                await send_whatsapp_message(
+                    SUPERVISOR_NUMBER,
+                    f"Tentative ADMIN refusee.\nNumero recu : {from_number}\nAjouter ce numero aux ADMIN_NUMBERS si autorise."
+                )
+                print(f"ADMIN refuse pour {from_number} - non dans ADMIN_NUMBERS: {ADMIN_NUMBERS}")
             return {"status": "ok"}
 
-        msg = messages[0]
-        sender = msg.get("from", "")
-        msg_type = msg.get("type", "")
+        # ADMIN image
+        if msg_type == "image" and from_number in ADMIN_NUMBERS:
+            caption = message["image"].get("caption", "").strip()
+            if caption.upper().startswith("ADMIN:"):
+                media_id = message["image"]["id"]
+                name = caption[6:].strip().lower()
+                product_images[name] = media_id
+                saved = await save_admin_image(name, media_id)
+                status = "enregistree" if saved else "enregistree en memoire uniquement"
 
-        # Message texte
-        if msg_type == "text":
-            text = msg.get("text", {}).get("body", "").strip()
+                # Vérifier si un client attendait cette image
+                client_en_attente = None
+                for prod_key, client_num in list(pending_product_image.items()):
+                    if prod_key in name or name in prod_key:
+                        client_en_attente = client_num
+                        del pending_product_image[prod_key]
+                        break
 
-            # Commande ADMIN
-            if text.upper().startswith("ADMIN:") and sender in ADMIN_NUMBERS:
-                info = text[6:].strip()
-                saved = await save_admin_knowledge(info)
-                if saved:
-                    await send_whatsapp(sender, "✅ Information sauvegardée. Rayan en tiendra compte.")
+                if client_en_attente:
+                    await asyncio.sleep(1)
+                    await send_whatsapp_image(client_en_attente, media_id)
+                    await send_whatsapp_message(
+                        from_number,
+                        f"Image {status} pour \"{name}\" et envoyee au client +{client_en_attente}."
+                    )
+                    print(f"Image '{name}' transmise au client {client_en_attente}")
                 else:
-                    await send_whatsapp(sender, "❌ Erreur lors de la sauvegarde.")
+                    await send_whatsapp_message(
+                        from_number,
+                        f"Image {status} pour Rayan : \"{name}\"."
+                    )
+                print(f"ADMIN image ajoutee : {name} -> {media_id}")
                 return {"status": "ok"}
 
-            # Message client normal
-            reply = await ask_rayan(sender, text)
-            await send_whatsapp(sender, reply)
+        # ── CAS 1 : MESSAGE DE WALLID ──────────────────────────────────────
+        if from_number == SUPERVISOR_NUMBER:
 
-            # Escalade si Rayan ne sait pas
-            if ESCALADE_TRIGGER in reply and SUPERVISOR_NUMBER:
-                notif = f"🐔 *Poulet d'Ci — Escalade Rayan*\nClient : {sender}\nQuestion : {text}\n\nRayan a transmis la demande."
-                await send_whatsapp(SUPERVISOR_NUMBER, notif)
+            # 1a. Wallid envoie une IMAGE
+            if msg_type == "image":
+                media_id = message["image"]["id"]
+                caption = message["image"].get("caption", "").strip()
 
-        # Localisation client
-        elif msg_type == "location" and SUPERVISOR_NUMBER:
-            loc = msg.get("location", {})
-            lat = loc.get("latitude", "")
-            lng = loc.get("longitude", "")
-            await send_whatsapp(sender, "📍 Localisation reçue ! Notre équipe vous contacte pour la livraison.")
-            await send_whatsapp(SUPERVISOR_NUMBER, f"📍 *Localisation client*\nNuméro : {sender}\nhttps://maps.google.com/?q={lat},{lng}")
+                # Cas A : ajout d'un photo produit au catalogue  →  "PHOTO: sac cabas"
+                if caption.upper().startswith("PHOTO:"):
+                    product_name = caption[6:].strip().lower()
+                    product_images[product_name] = media_id
+                    await send_whatsapp_message(
+                        SUPERVISOR_NUMBER,
+                        f"Photo enregistree pour le produit : {product_name}.\nCatalogue actuel : {', '.join(product_images.keys())}"
+                    )
+                    print(f"Photo produit ajoutee : {product_name} -> {media_id}")
+
+                # Cas B : capture Yango à transférer au client
+                elif pending_image_transfer:
+                    client_number = pending_image_transfer
+                    pending_image_transfer = ""
+
+                    await asyncio.sleep(random.uniform(1, 3))
+                    await send_whatsapp_image(
+                        client_number,
+                        media_id,
+                        caption="Voici les options de livraison pour votre adresse. Vous préférez Express ou 3H ?"
+                    )
+                    msgs = await load_conversation(client_number)
+                    msgs.append({"role": "assistant", "content": "J'ai envoyé la capture Yango au client avec les options Express et 3H."})
+                    await save_conversation(client_number, msgs[-20:])
+                    await send_whatsapp_message(SUPERVISOR_NUMBER, f"Capture transmise au client +{client_number}.")
+                    print(f"Capture Yango transmise au client {client_number}")
+
+                else:
+                    print("Image de Wallid non reconnue (pas de PHOTO: et pas de client en attente).")
+                return {"status": "ok"}
+
+            # 1b. Wallid envoie un TEXTE → réponse améliorée pour client en attente
+            if msg_type == "text":
+                user_text = message["text"]["body"]
+                if pending_supervisor:
+                    client_number, original_question = next(iter(pending_supervisor.items()))
+                    del pending_supervisor[client_number]
+
+                    await asyncio.sleep(random.uniform(2, 4))
+                    improved_reply = await improve_supervisor_draft(client_number, original_question, user_text)
+                    await send_whatsapp_message(client_number, improved_reply)
+                    await send_whatsapp_message(SUPERVISOR_NUMBER, f"Reponse transmise au client +{client_number}.")
+                    print(f"Réponse améliorée envoyée au client {client_number}")
+                else:
+                    print("Texte de Wallid sans client en attente, ignoré.")
+            return {"status": "ok"}
+
+        # ── CAS 2 : MESSAGE D'UN CLIENT ────────────────────────────────────
+
+        # 2a. Client envoie sa LOCALISATION WhatsApp
+        if msg_type == "location":
+            location = message["location"]
+            lat = location.get("latitude", "")
+            lng = location.get("longitude", "")
+            name = location.get("name", "")
+            address = location.get("address", "")
+            location_info = f"lat:{lat}, lng:{lng}"
+            if name:
+                location_info += f", {name}"
+            if address:
+                location_info += f", {address}"
+
+            await send_whatsapp_message(from_number, "Merci, j'ai bien reçu votre localisation. Je reviens vers vous avec les options de livraison.")
+            await notify_supervisor_location(from_number, location_info)
+            return {"status": "ok"}
+
+        # 2b. Client envoie un TEXTE
+        if msg_type == "text":
+            user_text = message["text"]["body"]
+            print(f"Texte client {from_number}: {user_text}")
+
+            await asyncio.sleep(random.uniform(2, 5))
+            reply = await get_claude_response(from_number, user_text)
+            await send_whatsapp_message(from_number, reply)
+            print(f"Réponse envoyée à {from_number}: {reply[:60]}...")
+
+            # Envoi automatique de photo basé sur l'historique de conversation
+            historique = await load_conversation(from_number)
+            historique_texte = "\n".join([f"{m['role']}: {m['content']}" for m in historique[-6:]])
+            produits_disponibles = ", ".join(product_images.keys()) if product_images else "aucun"
+            detection_prompt = f"""Analyse cette conversation WhatsApp.
+
+Produits avec images disponibles : {produits_disponibles}
+
+Conversation récente :
+{historique_texte}
+
+Le client demande-t-il à voir une image ou un visuel d'un produit (explicitement ou en référence à la conversation précédente) ?
+Ignore les fautes d'orthographe.
+- Si oui ET le produit est dans la liste : réponds avec le nom exact du produit de la liste.
+- Si oui MAIS le produit n'est pas dans la liste : réponds "demande:" suivi du nom du produit demandé (ex: "demande:carte de remerciement").
+- Sinon : réponds uniquement "non"."""
+
+            async with httpx.AsyncClient(timeout=15.0) as c:
+                det = await c.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 60, "messages": [{"role": "user", "content": detection_prompt}]}
+                )
+            produit_detecte = det.json()["content"][0]["text"].strip().lower()
+            print(f"Détection image : '{produit_detecte}'")
+
+            if produit_detecte != "non":
+                if produit_detecte.startswith("demande:"):
+                    # Image manquante — demander à l'admin
+                    nom_produit = produit_detecte[8:].strip()
+                    pending_product_image[nom_produit] = from_number
+                    await send_whatsapp_message(
+                        SUPERVISOR_NUMBER,
+                        f"IMAGE MANQUANTE\nLe client +{from_number} demande une photo de : {nom_produit}\n\nEnvoie l'image avec la légende : ADMIN: {nom_produit}"
+                    )
+                    print(f"Admin notifié pour image manquante : '{nom_produit}'")
+                elif produit_detecte in product_images:
+                    await asyncio.sleep(1)
+                    await send_whatsapp_image(from_number, product_images[produit_detecte])
+                    print(f"Photo '{produit_detecte}' envoyée à {from_number}")
+
+            # Détection commande confirmée
+            asyncio.create_task(detecter_commande(from_number, historique))
+
+            # Détection paiement — expressions d'action passée uniquement (évite les faux positifs type "vous prenez Wave ?")
+            txt_lower = user_text.lower()
+            expr_paiement = [
+                "j'ai payé", "jai payé", "j'ai paye", "jai paye", "g payé", "g paye",
+                "j'ai envoyé", "jai envoyé", "j'ai fait le transfert", "j'ai fait le virement",
+                "paiement effectué", "paiement fait", "argent envoyé", "j'ai transféré",
+                "viens de payer", "vient de payer", "déjà payé", "deja paye"
+            ]
+            if any(expr in txt_lower for expr in expr_paiement):
+                await send_whatsapp_message(
+                    from_number,
+                    "Merci. Pourriez-vous nous envoyer la capture de confirmation de votre paiement ? Cela nous permettra de valider votre commande rapidement."
+                )
+                await send_whatsapp_message(
+                    SUPERVISOR_NUMBER,
+                    f"PAIEMENT SIGNALÉ\nClient : +{from_number}\nMessage : {user_text}\n\nEn attente de la capture."
+                )
+                print(f"Paiement signalé par {from_number}")
+
+            # Escalade texte si Rayan ne sait pas
+            if ESCALADE_TRIGGER in reply:
+                pending_supervisor[from_number] = user_text
+                await notify_supervisor(from_number, user_text)
+
+            # Relance client froid — annuler l'ancienne tâche si elle existe, en démarrer une nouvelle
+            if from_number in clients_en_attente_relance:
+                clients_en_attente_relance[from_number]["task"].cancel()
+            task = asyncio.create_task(relance_client_froid(from_number, user_text))
+            clients_en_attente_relance[from_number] = {"question": user_text, "task": task}
+
+            # Livraison : si Rayan vient de demander la localisation → prépare le suivi
+            if LIVRAISON_TRIGGER in reply.lower():
+                pending_image_transfer = from_number
+
+            return {"status": "ok"}
+
+        # 2c. Client envoie une IMAGE (modèle souhaité)
+        if msg_type == "image":
+            media_id = message["image"]["id"]
+            caption = message["image"].get("caption", "")
+
+            await asyncio.sleep(random.uniform(2, 4))
+
+            # Répondre au client
+            await send_whatsapp_message(
+                from_number,
+                "Bien reçu. Je transmets le modèle à notre équipe qui vous confirmera la disponibilité."
+            )
+
+            # Transférer la photo à Wallid avec contexte
+            await send_whatsapp_message(
+                SUPERVISOR_NUMBER,
+                f"MODELE CLIENT\nNumero : +{from_number}\nLe client souhaite ce modèle. Voir photo ci-dessous."
+            )
+            await send_whatsapp_image(SUPERVISOR_NUMBER, media_id, caption=caption)
+            print(f"Photo modèle du client {from_number} transférée à Wallid")
+            return {"status": "ok"}
+
+        # Autres types ignorés
+        print(f"Type non géré: {msg_type}")
 
     except Exception as e:
-        print(f"Erreur webhook : {e}")
+        print(f"Erreur: {e}")
 
     return {"status": "ok"}
 
+
 @app.get("/")
 async def root():
-    return {"status": "Rayan — Poulet d'Ci est en ligne 🐔"}
+    return {"status": "Poulet d'Ci WhatsApp Webhook actif - Rayan"}
